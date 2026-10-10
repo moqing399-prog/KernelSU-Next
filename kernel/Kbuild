@@ -137,7 +137,7 @@ KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm6
 $(info -- KernelSU-Next new DCACHE flush: $(KSU_NEW_DCACHE_FLUSH))
 
 ifndef KSU_NEXT_MANAGER_SIZE
-KSU_NEXT_MANAGER_SIZE := 0xe5d5db
+KSU_NEXT_MANAGER_SIZE := 0xe62667
 endif
 
 ifndef KSU_NEXT_MANAGER_HASH
