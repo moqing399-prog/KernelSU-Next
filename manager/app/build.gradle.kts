@@ -25,6 +25,10 @@ apksign {
 android {
     namespace = "com.rifsxd.ksunext"
 
+    defaultConfig {
+        applicationId = "com.openai.chatgpt"
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
