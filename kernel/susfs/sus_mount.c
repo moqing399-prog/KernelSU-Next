@@ -150,6 +150,7 @@
 #include "sus_mount_identity.h"
 #include "sus_mount_idmap.h"
 #include "sus_mount_policy.h"
+#include "sus_mount_view.h"
 #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 #include "susfs_kprobe.h"
 
@@ -789,27 +790,34 @@ static int sus_mount_newmnt_entry(struct kretprobe_instance *ri, struct pt_regs 
  * and the mountpoints this rule accepts are short (/data/adb/modules/<name>/mnt). */
 static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char **why)
 {
+    struct sus_mount_view view;
     struct path p;
     char *dp;
+    bool devname_ours, path_ours = false;
 
-    if (sus_mount_path_is_ours(r->mnt_devname)) {
+    sus_mount_view_from_mount(&view, r, SUS_MOUNT_CTX_RECORD);
+    devname_ours = sus_mount_path_is_ours(r->mnt_devname);
+    if (devname_ours) {
         *why = "devname";
-        return true;
+    } else {
+        if (!pfn_d_path)
+            return false;
+        p.mnt = &r->mnt;
+        p.dentry = r->mnt.mnt_root;
+        dp = sus_mount_d_path(&p, buf, buflen);
+        if (IS_ERR_OR_NULL(dp)) {
+            atomic_inc(&n_newmnt_pathfail);
+            return false;
+        }
+        sus_mount_view_set_path(&view, dp, strlen(dp));
+        path_ours = sus_mount_path_is_ours(dp);
+        if (path_ours)
+            *why = dp;
     }
-    if (!pfn_d_path)
+    if (sus_mount_record_decide(&view, devname_ours, path_ours) !=
+        SUS_MOUNT_RECORD_TAKE)
         return false;
-    p.mnt = &r->mnt;
-    p.dentry = r->mnt.mnt_root;
-    dp = sus_mount_d_path(&p, buf, buflen);
-    if (IS_ERR_OR_NULL(dp)) {
-        atomic_inc(&n_newmnt_pathfail);
-        return false;
-    }
-    if (sus_mount_path_is_ours(dp)) {
-        *why = dp;
-        return true;
-    }
-    return false;
+    return true;
 }
 
 static int sus_mount_newmnt_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1205,15 +1213,19 @@ module_param_cb(mount_stat, &sus_mount_stat_ops, NULL, 0400);
 static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vfsmount *mnt = (struct vfsmount *)regs->regs[1];
+    struct sus_mount_view view;
     struct mount *r;
+    bool ours;
 
     if (!susfs_ptr_plausible(mnt))
         return 0;
     r = real_mount(mnt);
+    sus_mount_view_from_mount(&view, r, SUS_MOUNT_CTX_SHOW);
     /* Cheap path first, and NOT only the id: a KSU mount in a namespace the
      * marking scan never reached (the zygote's, hence every app's) keeps a normal
      * id - see the identity note above sus_mount_is_ours(). */
-    if (!sus_mount_is_ours(r, SUS_MOUNT_KSU_ID_MIN, sus_mount_path_is_ours)) {
+    ours = sus_mount_is_ours(r, SUS_MOUNT_KSU_ID_MIN, sus_mount_path_is_ours);
+    if (!ours) {
         /* This mount is not ours but carries this id right now, which is proof the
          * id was recycled if we ever learned it (see the idmap note above). */
         sus_mount_idmap_drop((int)r->mnt_id);
@@ -1227,7 +1239,8 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     }
     /* domain gate, upstream patch:1561-1585: the su/ksu domain is not
      * touched at all, it must be able to see its own mounts. */
-    if (sus_mount_is_su_domain())
+    if (sus_mount_show_decide(&view, ours, sus_mount_is_su_domain()) ==
+        SUS_MOUNT_SHOW_VISIBLE)
         return 0;
     sus_mount_note_id(r);
     atomic_inc(&n_ident_hits);
@@ -1920,31 +1933,43 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             continue;
         }
 
-        if (sus_mount_path_is_ours(r->mnt_devname)) {
-            n_devname++;
-            shown = r->mnt_devname;
-        } else {
-            /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
-             * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is the
-             * mountpoint path show_mountinfo() prints. */
-            mnt_path.mnt = &r->mnt;
-            mnt_path.dentry = r->mnt.mnt_root;
-            dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
-            /* Diagnostic while the matching rule is being validated: the first few
-             * mounts show what d_path() actually renders for them. */
-            if (scan_logged < 40) {
-                scan_logged++;
-                SUSFS_LOGI("sus_mount: scan %s -> %s\n", r->mnt_devname,
-                        IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
+        {
+            struct sus_mount_view view;
+            bool devname_ours, path_ours = false;
+
+            sus_mount_view_from_mount(&view, r, SUS_MOUNT_CTX_SCAN);
+            devname_ours = sus_mount_path_is_ours(r->mnt_devname);
+            if (devname_ours) {
+                n_devname++;
+                shown = r->mnt_devname;
+            } else {
+                /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
+                 * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is the
+                 * mountpoint path show_mountinfo() prints. */
+                mnt_path.mnt = &r->mnt;
+                mnt_path.dentry = r->mnt.mnt_root;
+                dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
+                /* Diagnostic while the matching rule is being validated: the first few
+                 * mounts show what d_path() actually renders for them. */
+                if (scan_logged < 40) {
+                    scan_logged++;
+                    SUSFS_LOGI("sus_mount: scan %s -> %s\n", r->mnt_devname,
+                            IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
+                }
+                if (IS_ERR_OR_NULL(dp)) {
+                    n_dpath_err++;
+                    continue;
+                }
+                n_dpath_ok++;
+                sus_mount_view_set_path(&view, dp, strlen(dp));
+                path_ours = sus_mount_path_is_ours(dp);
+                if (!path_ours)
+                    continue;
+                shown = dp;
             }
-            if (IS_ERR_OR_NULL(dp)) {
-                n_dpath_err++;
+            if (sus_mount_record_decide(&view, devname_ours, path_ours) !=
+                SUS_MOUNT_RECORD_TAKE)
                 continue;
-            }
-            n_dpath_ok++;
-            if (!sus_mount_path_is_ours(dp))
-                continue;
-            shown = dp;
         }
 
         if (used >= n_batch) {
